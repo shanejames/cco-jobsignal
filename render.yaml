@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: cco-jobsignal
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: ALERT_SMS_FROM
+        sync: false
+      - key: ALERT_SMS_TO
+        sync: false
+      - key: ALERT_THRESHOLD
+        value: "8"
