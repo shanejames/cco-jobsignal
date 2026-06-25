@@ -28,6 +28,7 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const USER_NAME = process.env.USER_NAME || "Shane James";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
@@ -227,10 +228,8 @@ async function scoreRole(role) {
     "You screen job postings for one person and return strict JSON only. " +
     "No markdown, no code fences, no commentary. " +
     "The person you screen for: " + PROFILE + " " +
-    "When fit_score is 8 or higher, write an intro_note in this voice: " + WRITING_STYLE + " " +
-    "When fit_score is below 8, set intro_note to an empty string. " +
     "Return this exact shape: " +
-    '{"fit_score": <integer 1 to 10>, "fit_reasons": "<one short sentence, max 220 chars>", "intro_note": "<string>"}';
+    '{"fit_score": <integer 1 to 10>, "fit_reasons": "<one short sentence, max 220 chars>"}';
 
   const user =
     "Title: " + (role.title || "") + "\n" +
@@ -243,7 +242,7 @@ async function scoreRole(role) {
     const completion = await groq.chat.completions.create({
       model: GROQ_MODEL,
       temperature: 0.2,
-      max_tokens: 700,
+      max_tokens: 400,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user }
@@ -259,7 +258,7 @@ async function scoreRole(role) {
     return {
       fit_score: score,
       fit_reasons: String(parsed.fit_reasons || "").slice(0, 300),
-      intro_note: String(parsed.intro_note || "")
+      intro_note: ""
     };
   } catch (err) {
     console.log("Groq scoring failed, using fallback:", err.message);
@@ -268,22 +267,38 @@ async function scoreRole(role) {
 }
 
 // Write an intro note for a single role on demand, in your voice.
-async function draftNote(role) {
+async function draftEmail(role) {
   if (!groq) return "";
+  const resume = await getResume();
   const system =
-    "Write a short outreach note for this person to send about the job below. " +
-    "Use this voice exactly: " + WRITING_STYLE + " " +
-    "Do not invent facts about the company. Return only the note text, no preamble.";
+    "Write a complete, ready to send application email for the applicant, for the job below.\n\n" +
+    "VOICE, follow exactly:\n" +
+    "- Warm, sincere, humble, and compassionate. The applicant is not a confrontational person and is never cocky or clever for its own sake.\n" +
+    "- Open with genuine, quiet interest in the company and the people or customers they serve. Do NOT open by quoting or reacting to a line from the posting. Never use phrases like 'made me smile', 'caught my eye', 'jumped out at me', or any witty callback. No flattery, no jokes, no smart remarks.\n" +
+    "- Show real interest in the role and a wish to help, not a wish to impress.\n" +
+    "- Plain, human sentences a calm person would actually write. Nothing that sounds like marketing or like an AI wrote it.\n\n" +
+    "FACTS AND NUMBERS, strict:\n" +
+    "- You may only state facts, titles, companies, and numbers that appear in the applicant's resume below.\n" +
+    "- Never invent, estimate, round, or borrow any metric from anywhere else. If the resume has no relevant number, write the email with no numbers at all.\n\n" +
+    "STRUCTURE:\n" +
+    "- A short, sincere opening about them and the work.\n" +
+    "- A short middle that connects two or three relevant things from the resume to what this role needs.\n" +
+    "- A light, no pressure close.\n" +
+    "- End with exactly: Thank you, then the applicant's name on the next line.\n" +
+    "- Under 220 words. No em dashes; use commas, periods, parentheses, semicolons, or colons instead.\n" +
+    "- Return a subject line first as 'Subject: ...', then a blank line, then the greeting and body. No other preamble.";
   const user =
-    "About me: " + PROFILE + "\n\n" +
+    "Applicant name: " + USER_NAME + "\n\n" +
+    "Applicant resume (the only source for facts and numbers):\n" +
+    (resume ? resume.slice(0, 6000) : "(no resume on file, so use no numbers)") + "\n\n" +
     "Role title: " + (role.title || "") + "\n" +
     "Company: " + (role.company || "") + "\n" +
-    "Description: " + (role.description || "").slice(0, 2000);
+    "Full job posting:\n" + (role.description || "").slice(0, 4000);
   try {
     const completion = await groq.chat.completions.create({
       model: GROQ_MODEL,
-      temperature: 0.6,
-      max_tokens: 500,
+      temperature: 0.5,
+      max_tokens: 700,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user }
@@ -291,7 +306,42 @@ async function draftNote(role) {
     });
     return (completion.choices[0].message.content || "").trim();
   } catch (err) {
-    console.log("Draft note failed:", err.message);
+    console.log("Draft email failed:", err.message);
+    return "";
+  }
+}
+
+// Produce a practical resume tailoring kit for a role. Never rewrites or invents.
+async function tailorResume(role) {
+  if (!groq) return "";
+  const resume = await getResume();
+  if (!resume) return "";
+  const system =
+    "You tailor a resume to a job posting. Do NOT rewrite the resume and do NOT invent anything. " +
+    "Only work with what is in the applicant's master resume. Output plain text with these four sections, each with a short heading:\n" +
+    "1. Lead with these: 6 to 8 existing bullets or lines from the resume, copied or lightly trimmed, that match this role best.\n" +
+    "2. De-emphasize or cut: lines that are less relevant to this role.\n" +
+    "3. Keywords to include: exact terms from the posting the applicant should make sure appear, but only ones that are truthfully supported by the resume.\n" +
+    "4. Tailored summary: a 3 line summary for the top of the resume, in a warm and humble voice, using only facts from the resume.\n" +
+    "Keep it tight and practical. No em dashes.";
+  const user =
+    "Master resume:\n" + resume.slice(0, 6000) + "\n\n" +
+    "Role title: " + (role.title || "") + "\n" +
+    "Company: " + (role.company || "") + "\n" +
+    "Full job posting:\n" + (role.description || "").slice(0, 4000);
+  try {
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      temperature: 0.3,
+      max_tokens: 1200,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
+    });
+    return (completion.choices[0].message.content || "").trim();
+  } catch (err) {
+    console.log("Resume tailoring failed:", err.message);
     return "";
   }
 }
@@ -400,7 +450,33 @@ async function ensureSchema() {
       processed BOOLEAN DEFAULT FALSE
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query("ALTER TABLE roles ADD COLUMN IF NOT EXISTS tailor_text TEXT");
   console.log("Schema ready");
+}
+
+// The master resume is the single source of truth for facts and numbers in emails.
+async function getResume() {
+  try {
+    const result = await pool.query("SELECT value FROM app_settings WHERE key = 'master_resume'");
+    return result.rowCount ? (result.rows[0].value || "") : "";
+  } catch (err) {
+    return "";
+  }
+}
+
+async function setResume(text) {
+  await pool.query(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ('master_resume', $1, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+    [text || ""]
+  );
 }
 
 // Register the marketplace and email sources so they appear in source tracking
@@ -730,24 +806,68 @@ app.get("/roles/:id", checkAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const result = await pool.query("SELECT * FROM roles WHERE id = $1", [id]);
     if (result.rowCount === 0) return res.status(404).send("Role not found.");
-    res.send(renderRoleDetail(result.rows[0]));
+    const resume = await getResume();
+    res.send(renderRoleDetail(result.rows[0], !!resume));
   } catch (err) {
     console.log("Role detail failed:", err.message);
     res.status(500).send("Could not load that role. Refresh and try again.");
   }
 });
 
-app.post("/roles/:id/draft", checkAuth, async (req, res) => {
+app.post("/roles/:id/email", checkAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const result = await pool.query("SELECT * FROM roles WHERE id = $1", [id]);
     if (result.rowCount === 0) return res.status(404).send("Role not found.");
-    const note = await draftNote(result.rows[0]);
-    await pool.query("UPDATE roles SET draft_text = $1, updated_at = NOW() WHERE id = $2", [note, id]);
+    const role = result.rows[0];
+
+    // If you pasted the full posting, save it so the email has something rich to work from.
+    const fulltext = (req.body.fulltext || "").trim();
+    if (fulltext && fulltext.length > (role.description || "").length) {
+      await pool.query("UPDATE roles SET description = $1 WHERE id = $2", [fulltext.slice(0, 8000), id]);
+      role.description = fulltext.slice(0, 8000);
+    }
+
+    const email = await draftEmail(role);
+    await pool.query("UPDATE roles SET draft_text = $1, updated_at = NOW() WHERE id = $2", [email, id]);
     res.redirect("/roles/" + id);
   } catch (err) {
-    console.log("Draft generation failed:", err.message);
-    res.status(500).send("Could not write a note. Refresh and try again.");
+    console.log("Email generation failed:", err.message);
+    res.status(500).send("Could not write the email. Refresh and try again.");
+  }
+});
+
+app.post("/roles/:id/tailor", checkAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const result = await pool.query("SELECT * FROM roles WHERE id = $1", [id]);
+    if (result.rowCount === 0) return res.status(404).send("Role not found.");
+    const kit = await tailorResume(result.rows[0]);
+    await pool.query("UPDATE roles SET tailor_text = $1, updated_at = NOW() WHERE id = $2", [kit, id]);
+    res.redirect("/roles/" + id);
+  } catch (err) {
+    console.log("Tailor failed:", err.message);
+    res.status(500).send("Could not tailor the resume. Refresh and try again.");
+  }
+});
+
+app.get("/resume", checkAuth, async (req, res) => {
+  try {
+    const resume = await getResume();
+    res.send(renderResumePage(resume, req.query));
+  } catch (err) {
+    console.log("Resume page failed:", err.message);
+    res.status(500).send("Could not load the resume page. Refresh and try again.");
+  }
+});
+
+app.post("/resume", checkAuth, async (req, res) => {
+  try {
+    await setResume((req.body.resume || "").slice(0, 20000));
+    res.redirect("/resume?saved=1");
+  } catch (err) {
+    console.log("Resume save failed:", err.message);
+    res.status(500).send("Could not save the resume. Refresh and try again.");
   }
 });
 
@@ -887,7 +1007,7 @@ function renderDashboard(rows, filter) {
     ".bulkbar .b-low{margin-left:auto;color:#a02626;border-color:#f0c9c9}" +
     ".empty{padding:40px 0;text-align:center;color:var(--soft)}" +
     "</style></head><body>" +
-    "<header><h1>JobSignal</h1><p>Fractional and interim Customer Success roles, scored against your profile.</p><a class=\"headlink\" href=\"/paste\">Paste an alert email</a></header>" +
+    "<header><h1>JobSignal</h1><p>Fractional and interim Customer Success roles, scored against your profile.</p><a class=\"headlink\" href=\"/paste\">Paste an alert email</a> &nbsp; <a class=\"headlink\" href=\"/resume\">My resume</a></header>" +
     '<div class="tabs">' + tabs + "</div>" +
     '<div class="wrap">' +
     (rows.length
@@ -917,21 +1037,46 @@ function statusButton(id, status, current) {
   );
 }
 
-function renderRoleDetail(r) {
+function renderRoleDetail(r, hasResume) {
   const apply = r.url
     ? '<a class="apply" href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener">Open posting and apply</a>'
     : '<div class="noapply">No direct link on this one. Search the company site or the board it came from to apply.</div>';
 
-  const noteBlock = r.draft_text
-    ? '<div class="note"><div class="notehead">Your intro note</div><pre id="note">' + escapeHtml(r.draft_text) + "</pre>" +
-      '<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'note\').innerText)">Copy note</button>' +
-      '<form method="post" action="/roles/' + r.id + '/draft" style="display:inline">' +
+  const emailBlock = r.draft_text
+    ? '<div class="note"><div class="notehead">Your application email</div><pre id="note">' + escapeHtml(r.draft_text) + "</pre>" +
+      '<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'note\').innerText)">Copy email</button>' +
+      '<form method="post" action="/roles/' + r.id + '/email" style="display:inline">' +
+      '<input type="hidden" name="fulltext" value="">' +
       '<button class="rewrite" type="submit">Rewrite</button></form></div>'
-    : '<form method="post" action="/roles/' + r.id + '/draft"><button class="writenote" type="submit">Write an intro note in my voice</button></form>';
+    : "";
+
+  const generator =
+    '<form method="post" action="/roles/' + r.id + '/email" class="gen">' +
+    '<div class="genhint">Paste the full job posting here so the email can speak to it. If the description below already looks complete, you can leave this as is and just click the button.</div>' +
+    '<textarea name="fulltext" placeholder="Paste the full job posting here">' + escapeHtml(r.description || "") + "</textarea>" +
+    '<button class="writenote" type="submit">Write my application email</button>' +
+    "</form>";
+
+  const noteBlock = emailBlock + generator;
 
   const desc = r.description
     ? '<div class="desc">' + escapeHtml(r.description).replace(/\n/g, "<br>") + "</div>"
-    : '<div class="desc soft">No description was captured for this role. Open the posting for full details.</div>';
+    : '<div class="desc soft">No description was captured for this role. Paste the posting above and generate the email from it.</div>';
+
+  let tailorBlock;
+  if (!hasResume) {
+    tailorBlock = '<div class="genhint">Add your master resume on the <a href="/resume">Resume page</a> to turn this on. Once it is saved, this writes a short tailoring kit (which bullets to lead with, keywords to include, and a tailored summary) using only what is in your resume.</div>';
+  } else if (r.tailor_text) {
+    tailorBlock =
+      '<div class="note"><div class="notehead">Tailoring kit for this role</div><pre id="tailor">' + escapeHtml(r.tailor_text) + "</pre>" +
+      '<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'tailor\').innerText)">Copy kit</button>' +
+      '<form method="post" action="/roles/' + r.id + '/tailor" style="display:inline">' +
+      '<button class="rewrite" type="submit">Regenerate</button></form></div>';
+  } else {
+    tailorBlock =
+      '<div class="genhint">This reads your master resume against this posting and tells you which of your existing bullets to lead with, which keywords to include, and a tailored summary. It never rewrites or invents anything.</div>' +
+      '<form method="post" action="/roles/' + r.id + '/tailor"><button class="writenote" type="submit">Tailor my resume for this role</button></form>';
+  }
 
   return (
     "<!doctype html><html><head><meta charset=\"utf-8\">" +
@@ -956,12 +1101,14 @@ function renderRoleDetail(r) {
     ".note pre{white-space:pre-wrap;font-family:inherit;font-size:14px;line-height:1.6;margin:0 0 12px}" +
     "button{cursor:pointer;border-radius:8px;font-size:13px;padding:9px 14px;font-weight:600}" +
     ".writenote{background:var(--navy);color:#fff;border:0}" +
+    ".gen{margin-top:8px}.genhint{font-size:13px;color:var(--soft);margin-bottom:8px;line-height:1.5}" +
+    ".gen textarea{width:100%;min-height:160px;border:1px solid var(--line);border-radius:10px;padding:12px;font-family:inherit;font-size:13px;line-height:1.5;margin-bottom:10px;resize:vertical}" +
     ".copy{background:var(--navy);color:#fff;border:0;margin-right:8px}.rewrite{background:#fff;color:var(--ink);border:1px solid var(--line)}" +
     ".actions{margin-top:20px;display:flex;gap:8px}" +
     ".actions button{background:#fff;border:1px solid var(--line);color:var(--ink)}" +
     ".actions button.on{background:var(--navy);color:#fff;border-color:var(--navy)}" +
     "</style></head><body>" +
-    "<header><a href=\"/\">Back to all roles</a></header>" +
+    "<header><a href=\"/\">Back to all roles</a> &nbsp; <a href=\"/resume\">Resume</a></header>" +
     '<div class="wrap">' +
     '<span class="score" style="background:' + scoreColor(r.fit_score) + '">' + r.fit_score + "/10</span>" +
     "<h1>" + escapeHtml(r.title || "") + "</h1>" +
@@ -969,7 +1116,8 @@ function renderRoleDetail(r) {
       (r.comp_text ? " &middot; " + escapeHtml(r.comp_text) : "") + "</div>" +
     (r.fit_reasons ? '<div class="reasons">' + escapeHtml(r.fit_reasons) + "</div>" : "") +
     apply +
-    '<div class="sect">How to apply</div>' + noteBlock +
+    '<div class="sect">Application email</div>' + noteBlock +
+    '<div class="sect">Tailor my resume</div>' + tailorBlock +
     '<div class="sect">Full description</div>' + desc +
     '<div class="actions">' +
       statusButton(r.id, "applied", r.status) +
@@ -977,6 +1125,35 @@ function renderRoleDetail(r) {
       statusButton(r.id, "reviewed", r.status) +
     "</div>" +
     "</div></body></html>"
+  );
+}
+
+function renderResumePage(resume, query) {
+  let banner = "";
+  if (query && query.saved) {
+    banner = '<div class="banner ok">Saved. Your emails and tailoring kits now use this resume as the source of truth.</div>';
+  }
+  return (
+    "<!doctype html><html><head><meta charset=\"utf-8\">" +
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+    "<title>My resume</title>" +
+    "<style>" +
+    ":root{--navy:#0F2C57;--ink:#1a202c;--soft:#718096;--line:#e2e8f0;--bg:#f7fafc}" +
+    "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}" +
+    "header{background:var(--navy);color:#fff;padding:18px 20px}header h1{margin:0;font-size:18px}header a{color:#fff;font-size:13px;text-decoration:underline}" +
+    ".wrap{padding:18px 20px 60px;max-width:760px;margin:0 auto}" +
+    ".banner{padding:12px 14px;border-radius:10px;margin-bottom:16px;font-size:14px;background:#e6f6ec;color:#1f7a44}" +
+    ".hint{font-size:14px;color:var(--soft);line-height:1.6;margin-bottom:14px}" +
+    "textarea{width:100%;min-height:420px;border:1px solid var(--line);border-radius:10px;padding:14px;font-family:inherit;font-size:14px;line-height:1.6;resize:vertical}" +
+    "button{margin-top:16px;background:var(--navy);color:#fff;border:0;border-radius:10px;padding:13px 18px;font-size:15px;font-weight:600;cursor:pointer}" +
+    "</style></head><body>" +
+    "<header><h1>My resume</h1><div><a href=\"/\">Back to dashboard</a></div></header>" +
+    '<div class="wrap">' + banner +
+    '<p class="hint">Paste your master resume here once. This is the single source of truth. Application emails and tailoring kits only use facts and numbers that appear in this text, so nothing gets invented. Plain text works best; you can paste straight from your Word or Google doc.</p>' +
+    '<form method="post" action="/resume">' +
+    '<textarea name="resume" placeholder="Paste your full resume here">' + escapeHtml(resume || "") + "</textarea>" +
+    '<button type="submit">Save resume</button>' +
+    "</form></div></body></html>"
   );
 }
 
