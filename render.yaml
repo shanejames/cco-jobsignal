@@ -23,5 +23,9 @@ services:
         sync: false
       - key: ALERT_SMS_TO
         sync: false
+      - key: IMAP_USER
+        sync: false
+      - key: IMAP_PASS
+        sync: false
       - key: ALERT_THRESHOLD
         value: "8"

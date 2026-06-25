@@ -57,6 +57,23 @@ Optional tuning:
 - ALERT_THRESHOLD: score that triggers a text. Default 8.
 - GROQ_MODEL: defaults to openai/gpt-oss-120b. Override here if you want a different Groq model.
 
+## The forwarding inbox (hands-off ingestion)
+
+Instead of pasting emails by hand, set up a dedicated mailbox that the app reads on every cycle.
+Forward (or auto-forward) job alert emails to it and they flow in on their own.
+
+1. Create a new free Gmail just for this, for example ccojobsignal@gmail.com.
+2. Turn on 2 Step Verification on that account, then create an App Password
+   (Google Account, Security, App passwords). It gives you a 16 character password.
+3. In Render add:
+   - IMAP_USER: the full address (ccojobsignal@gmail.com)
+   - IMAP_PASS: the 16 character App Password (not your normal password)
+4. In your main Gmail, set up a filter that auto-forwards LinkedIn, Indeed, Go Fractional, and
+   newsletter alerts to the new address. Gmail to Gmail forwarding only needs one confirmation click.
+
+On each cycle the app reads unread messages in that inbox, pulls out the postings, scores them,
+texts you the strong ones, and marks the email read. It tags the source from the sender automatically.
+
 Optional email digest (uses Resend, which you already use for Arinton):
 - RESEND_API_KEY, ALERT_EMAIL_FROM, ALERT_EMAIL_TO.
 

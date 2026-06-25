@@ -10,6 +10,8 @@ const express = require("express");
 const { Pool } = require("pg");
 const Parser = require("rss-parser");
 const cron = require("node-cron");
+const { ImapFlow } = require("imapflow");
+const { simpleParser } = require("mailparser");
 
 let Groq = null;
 try {
@@ -37,6 +39,12 @@ const ALERT_EMAIL_FROM = process.env.ALERT_EMAIL_FROM || "";
 const ALERT_EMAIL_TO = process.env.ALERT_EMAIL_TO || "";
 const ALERT_THRESHOLD = parseInt(process.env.ALERT_THRESHOLD || "8", 10);
 const RUN_INTERNAL_CRON = (process.env.RUN_INTERNAL_CRON || "true") === "true";
+
+// Dedicated inbox the app reads on each cycle. Forward job alert emails here.
+const IMAP_HOST = process.env.IMAP_HOST || "imap.gmail.com";
+const IMAP_PORT = parseInt(process.env.IMAP_PORT || "993", 10);
+const IMAP_USER = process.env.IMAP_USER || "";
+const IMAP_PASS = process.env.IMAP_PASS || "";
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -182,6 +190,18 @@ function looksRelevant(role) {
   return KEYWORDS.some((k) => hay.includes(k));
 }
 
+// Guess which board an email came from based on the sender address.
+function detectSourceFromAddress(from) {
+  const f = (from || "").toLowerCase();
+  if (f.includes("linkedin")) return "LinkedIn";
+  if (f.includes("indeed")) return "Indeed";
+  if (f.includes("gofractional") || f.includes("go fractional")) return "Go Fractional";
+  if (f.includes("fractionaljobs")) return "Fractional Jobs";
+  if (f.includes("fractionalpulse") || f.includes("fractional pulse")) return "Fractional Pulse";
+  if (f.includes("bolster")) return "Bolster";
+  return "Email inbox";
+}
+
 function keywordScore(role) {
   const hay = (role.title + " " + role.description).toLowerCase();
   let score = 3;
@@ -244,6 +264,35 @@ async function scoreRole(role) {
   } catch (err) {
     console.log("Groq scoring failed, using fallback:", err.message);
     return keywordScore(role);
+  }
+}
+
+// Write an intro note for a single role on demand, in your voice.
+async function draftNote(role) {
+  if (!groq) return "";
+  const system =
+    "Write a short outreach note for this person to send about the job below. " +
+    "Use this voice exactly: " + WRITING_STYLE + " " +
+    "Do not invent facts about the company. Return only the note text, no preamble.";
+  const user =
+    "About me: " + PROFILE + "\n\n" +
+    "Role title: " + (role.title || "") + "\n" +
+    "Company: " + (role.company || "") + "\n" +
+    "Description: " + (role.description || "").slice(0, 2000);
+  try {
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      temperature: 0.6,
+      max_tokens: 500,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
+    });
+    return (completion.choices[0].message.content || "").trim();
+  } catch (err) {
+    console.log("Draft note failed:", err.message);
+    return "";
   }
 }
 
@@ -525,6 +574,55 @@ async function ingestEmail(subject, body, sourceName) {
 }
 
 // ---------------------------------------------------------------------------
+// Read the dedicated inbox over IMAP. Forward job alerts to this mailbox and the
+// app pulls each unread message, parses it, scores it, and marks it read.
+// ---------------------------------------------------------------------------
+
+async function pollInbox() {
+  if (!IMAP_USER || !IMAP_PASS) return { skipped: "inbox not configured" };
+
+  const client = new ImapFlow({
+    host: IMAP_HOST,
+    port: IMAP_PORT,
+    secure: true,
+    auth: { user: IMAP_USER, pass: IMAP_PASS },
+    logger: false
+  });
+
+  let added = 0;
+  let read = 0;
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const uids = await client.search({ seen: false }, { uid: true });
+      for (const uid of uids) {
+        const msg = await client.fetchOne(uid, { source: true }, { uid: true });
+        if (!msg || !msg.source) continue;
+        const parsed = await simpleParser(msg.source);
+        const subject = parsed.subject || "";
+        const body = parsed.text || stripHtml(parsed.html || "") || "";
+        const from = (parsed.from && parsed.from.text) || "";
+        const source = detectSourceFromAddress(from);
+        const result = await ingestEmail(subject, body, source);
+        if (result && result.added) added += result.added;
+        read += 1;
+        await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true });
+      }
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    console.log("Inbox poll failed:", err.message);
+    return { error: err.message };
+  } finally {
+    try { await client.logout(); } catch (e) { /* ignore */ }
+  }
+  console.log("Inbox poll complete, read " + read + " email(s), added " + added + " role(s)");
+  return { read: read, added: added };
+}
+
+// ---------------------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------------------
 
@@ -555,7 +653,17 @@ app.get("/health", (req, res) => res.json({ ok: true, groq: !!groq, time: new Da
 app.get("/cron/poll", cronAuth, async (req, res) => {
   try {
     const added = await pollSources();
-    res.json({ ok: true, added: added });
+    const inbox = await pollInbox();
+    res.json({ ok: true, feedsAdded: added, inbox: inbox });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/cron/inbox", cronAuth, async (req, res) => {
+  try {
+    const inbox = await pollInbox();
+    res.json({ ok: true, inbox: inbox });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -610,10 +718,36 @@ app.post("/roles/:id/status", checkAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const status = (req.body.status || "").slice(0, 20);
     await pool.query("UPDATE roles SET status = $1, updated_at = NOW() WHERE id = $2", [status, id]);
-    res.redirect("/");
+    res.redirect(req.get("Referer") || "/");
   } catch (err) {
     console.log("Status update failed:", err.message);
     res.status(500).send("Could not update that role. Refresh and try again.");
+  }
+});
+
+app.get("/roles/:id", checkAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const result = await pool.query("SELECT * FROM roles WHERE id = $1", [id]);
+    if (result.rowCount === 0) return res.status(404).send("Role not found.");
+    res.send(renderRoleDetail(result.rows[0]));
+  } catch (err) {
+    console.log("Role detail failed:", err.message);
+    res.status(500).send("Could not load that role. Refresh and try again.");
+  }
+});
+
+app.post("/roles/:id/draft", checkAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const result = await pool.query("SELECT * FROM roles WHERE id = $1", [id]);
+    if (result.rowCount === 0) return res.status(404).send("Role not found.");
+    const note = await draftNote(result.rows[0]);
+    await pool.query("UPDATE roles SET draft_text = $1, updated_at = NOW() WHERE id = $2", [note, id]);
+    res.redirect("/roles/" + id);
+  } catch (err) {
+    console.log("Draft generation failed:", err.message);
+    res.status(500).send("Could not write a note. Refresh and try again.");
   }
 });
 
@@ -667,10 +801,11 @@ function renderDashboard(rows, filter) {
       '<div class="card">' +
         '<div class="score" style="background:' + scoreColor(r.fit_score) + '">' + r.fit_score + "</div>" +
         '<div class="body">' +
-          '<div class="title">' + escapeHtml(r.title) + "</div>" +
+          '<a class="title" href="/roles/' + r.id + '">' + escapeHtml(r.title) + "</a>" +
           '<div class="meta">' + escapeHtml(r.company || "Company unknown") + " &middot; " + escapeHtml(r.location || "") +
             (r.comp_text ? " &middot; " + escapeHtml(r.comp_text) : "") + "</div>" +
           '<div class="reasons">' + escapeHtml(r.fit_reasons || "") + "</div>" +
+          '<a class="link" href="/roles/' + r.id + '">View details and apply</a>' +
           (r.url ? '<a class="link" href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener">Open posting</a>' : "") +
           '<span class="src">' + escapeHtml(r.source || "") + "</span>" +
           draft +
@@ -702,7 +837,8 @@ function renderDashboard(rows, filter) {
     ".card{display:flex;gap:14px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}" +
     ".score{flex:0 0 46px;height:46px;border-radius:10px;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px}" +
     ".body{flex:1;min-width:0}" +
-    ".title{font-weight:600;font-size:15px;line-height:1.3}" +
+    ".title{display:block;font-weight:600;font-size:15px;line-height:1.3;color:var(--ink);text-decoration:none}" +
+    ".title:hover{color:var(--navy);text-decoration:underline}" +
     ".meta{color:var(--soft);font-size:13px;margin-top:3px}" +
     ".reasons{font-size:13px;margin-top:6px;color:#2d3748}" +
     ".link{display:inline-block;margin-top:8px;margin-right:10px;color:var(--navy);font-size:13px;font-weight:600;text-decoration:none}" +
@@ -728,6 +864,69 @@ function statusButton(id, status, current) {
     '<form method="post" action="/roles/' + id + '/status" style="display:inline">' +
     '<input type="hidden" name="status" value="' + status + '">' +
     '<button class="' + on.trim() + '" type="submit">' + status + "</button></form>"
+  );
+}
+
+function renderRoleDetail(r) {
+  const apply = r.url
+    ? '<a class="apply" href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener">Open posting and apply</a>'
+    : '<div class="noapply">No direct link on this one. Search the company site or the board it came from to apply.</div>';
+
+  const noteBlock = r.draft_text
+    ? '<div class="note"><div class="notehead">Your intro note</div><pre id="note">' + escapeHtml(r.draft_text) + "</pre>" +
+      '<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'note\').innerText)">Copy note</button>' +
+      '<form method="post" action="/roles/' + r.id + '/draft" style="display:inline">' +
+      '<button class="rewrite" type="submit">Rewrite</button></form></div>'
+    : '<form method="post" action="/roles/' + r.id + '/draft"><button class="writenote" type="submit">Write an intro note in my voice</button></form>';
+
+  const desc = r.description
+    ? '<div class="desc">' + escapeHtml(r.description).replace(/\n/g, "<br>") + "</div>"
+    : '<div class="desc soft">No description was captured for this role. Open the posting for full details.</div>';
+
+  return (
+    "<!doctype html><html><head><meta charset=\"utf-8\">" +
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+    "<title>" + escapeHtml(r.title || "Role") + "</title>" +
+    "<style>" +
+    ":root{--navy:#0F2C57;--ink:#1a202c;--soft:#718096;--line:#e2e8f0;--bg:#f7fafc}" +
+    "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}" +
+    "header{background:var(--navy);color:#fff;padding:18px 20px}header a{color:#fff;font-size:13px;text-decoration:underline}" +
+    ".wrap{padding:20px;max-width:760px;margin:0 auto}" +
+    ".score{display:inline-block;color:#fff;border-radius:8px;padding:4px 12px;font-weight:700;font-size:15px;margin-bottom:10px}" +
+    "h1{font-size:20px;margin:6px 0 4px}" +
+    ".meta{color:var(--soft);font-size:14px;margin-bottom:6px}" +
+    ".reasons{font-size:14px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;margin:12px 0}" +
+    ".apply{display:inline-block;background:var(--navy);color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600;margin:6px 0 18px}" +
+    ".noapply{font-size:14px;color:var(--soft);margin:6px 0 18px}" +
+    ".sect{font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--soft);margin:18px 0 8px}" +
+    ".desc{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px;font-size:14px;line-height:1.6}" +
+    ".desc.soft{color:var(--soft)}" +
+    ".note{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px;margin-top:8px}" +
+    ".notehead{font-weight:600;font-size:14px;margin-bottom:8px}" +
+    ".note pre{white-space:pre-wrap;font-family:inherit;font-size:14px;line-height:1.6;margin:0 0 12px}" +
+    "button{cursor:pointer;border-radius:8px;font-size:13px;padding:9px 14px;font-weight:600}" +
+    ".writenote{background:var(--navy);color:#fff;border:0}" +
+    ".copy{background:var(--navy);color:#fff;border:0;margin-right:8px}.rewrite{background:#fff;color:var(--ink);border:1px solid var(--line)}" +
+    ".actions{margin-top:20px;display:flex;gap:8px}" +
+    ".actions button{background:#fff;border:1px solid var(--line);color:var(--ink)}" +
+    ".actions button.on{background:var(--navy);color:#fff;border-color:var(--navy)}" +
+    "</style></head><body>" +
+    "<header><a href=\"/\">Back to all roles</a></header>" +
+    '<div class="wrap">' +
+    '<span class="score" style="background:' + scoreColor(r.fit_score) + '">' + r.fit_score + "/10</span>" +
+    "<h1>" + escapeHtml(r.title || "") + "</h1>" +
+    '<div class="meta">' + escapeHtml(r.company || "Company unknown") + " &middot; " + escapeHtml(r.location || "") +
+      (r.comp_text ? " &middot; " + escapeHtml(r.comp_text) : "") + "</div>" +
+    (r.fit_reasons ? '<div class="reasons">' + escapeHtml(r.fit_reasons) + "</div>" : "") +
+    apply +
+    '<div class="sect">How to apply</div>' + noteBlock +
+    '<div class="sect">Full description</div>' + desc +
+    '<div class="actions">' +
+      statusButton(r.id, "applied", r.status) +
+      statusButton(r.id, "passed", r.status) +
+      statusButton(r.id, "reviewed", r.status) +
+    "</div>" +
+    "</div></body></html>"
   );
 }
 
@@ -794,6 +993,7 @@ async function boot() {
     cron.schedule("*/20 * * * *", async () => {
       try {
         await pollSources();
+        await pollInbox();
       } catch (err) {
         console.log("Internal cron poll failed:", err.message);
       }
