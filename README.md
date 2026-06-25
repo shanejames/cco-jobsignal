@@ -55,7 +55,7 @@ For instant alerts by text (uses your existing Twilio account):
 
 Optional tuning:
 - ALERT_THRESHOLD: score that triggers a text. Default 8.
-- GROQ_MODEL: defaults to llama-3.1-8b-instant.
+- GROQ_MODEL: defaults to openai/gpt-oss-120b. Override here if you want a different Groq model.
 
 Optional email digest (uses Resend, which you already use for Arinton):
 - RESEND_API_KEY, ALERT_EMAIL_FROM, ALERT_EMAIL_TO.
