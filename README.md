@@ -57,6 +57,21 @@ Optional tuning:
 - ALERT_THRESHOLD: score that triggers a text. Default 8.
 - GROQ_MODEL: defaults to openai/gpt-oss-120b. Override here if you want a different Groq model.
 
+## Your resume, emails, and tailoring
+
+Open "My resume" from the dashboard header and paste your master resume once. It is the single
+source of truth. Two features use it:
+
+- Application emails (on any role's detail page) are written in a warm, humble voice and may only
+  use facts and numbers that appear in your resume. Nothing gets invented. The email closes with
+  "Thank you" and your name. Paste the full posting into the box first so the email speaks to it.
+- The tailoring kit (also on the detail page) reads your resume against the posting and tells you
+  which existing bullets to lead with, which keywords to include, and a tailored summary. It never
+  rewrites or invents, it only reorders and surfaces what you already wrote.
+
+Optional env var:
+- USER_NAME: the name the emails sign off with. Defaults to Shane James.
+
 ## The forwarding inbox (hands-off ingestion)
 
 Instead of pasting emails by hand, set up a dedicated mailbox that the app reads on every cycle.
