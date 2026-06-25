@@ -751,6 +751,41 @@ app.post("/roles/:id/draft", checkAuth, async (req, res) => {
   }
 });
 
+app.post("/roles/bulk", checkAuth, async (req, res) => {
+  try {
+    let ids = req.body.ids;
+    const status = (req.body.status || "").slice(0, 20);
+    if (!ids || !status) return res.redirect(req.get("Referer") || "/");
+    if (!Array.isArray(ids)) ids = [ids];
+    const intIds = ids.map((x) => parseInt(x, 10)).filter((n) => !isNaN(n));
+    if (intIds.length) {
+      await pool.query(
+        "UPDATE roles SET status = $1, updated_at = NOW() WHERE id = ANY($2::int[])",
+        [status, intIds]
+      );
+    }
+    res.redirect(req.get("Referer") || "/");
+  } catch (err) {
+    console.log("Bulk update failed:", err.message);
+    res.status(500).send("Bulk update failed. Refresh and try again.");
+  }
+});
+
+app.post("/roles/passlow", checkAuth, async (req, res) => {
+  try {
+    let max = parseInt(req.body.max || "4", 10);
+    if (isNaN(max)) max = 4;
+    await pool.query(
+      "UPDATE roles SET status = 'passed', updated_at = NOW() WHERE status IN ('new','reviewed') AND fit_score <= $1",
+      [max]
+    );
+    res.redirect(req.get("Referer") || "/");
+  } catch (err) {
+    console.log("Pass-low failed:", err.message);
+    res.status(500).send("Could not pass the low roles. Refresh and try again.");
+  }
+});
+
 app.get("/", checkAuth, async (req, res) => {
   try {
     const filter = req.query.status || "active";
@@ -799,6 +834,7 @@ function renderDashboard(rows, filter) {
       : "";
     return (
       '<div class="card">' +
+        '<input class="rowpick" type="checkbox" name="ids" value="' + r.id + '">' +
         '<div class="score" style="background:' + scoreColor(r.fit_score) + '">' + r.fit_score + "</div>" +
         '<div class="body">' +
           '<a class="title" href="/roles/' + r.id + '">' + escapeHtml(r.title) + "</a>" +
@@ -808,12 +844,8 @@ function renderDashboard(rows, filter) {
           '<a class="link" href="/roles/' + r.id + '">View details and apply</a>' +
           (r.url ? '<a class="link" href="' + escapeHtml(r.url) + '" target="_blank" rel="noopener">Open posting</a>' : "") +
           '<span class="src">' + escapeHtml(r.source || "") + "</span>" +
+          (r.status && r.status !== "new" ? '<span class="badge">' + escapeHtml(r.status) + "</span>" : "") +
           draft +
-          '<div class="actions">' +
-            statusButton(r.id, "applied", r.status) +
-            statusButton(r.id, "passed", r.status) +
-            statusButton(r.id, "reviewed", r.status) +
-          "</div>" +
         "</div>" +
       "</div>"
     );
@@ -845,16 +877,34 @@ function renderDashboard(rows, filter) {
     ".src{font-size:11px;color:var(--soft)}" +
     ".draft{margin-top:8px}.draft summary{cursor:pointer;font-size:13px;color:var(--navy)}" +
     ".draft pre{white-space:pre-wrap;font-family:inherit;font-size:13px;background:var(--bg);padding:10px;border-radius:8px;margin-top:6px}" +
-    ".actions{margin-top:10px;display:flex;gap:8px}" +
-    ".actions button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer;color:var(--ink)}" +
-    ".actions button.on{background:var(--navy);color:#fff;border-color:var(--navy)}" +
+    ".badge{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;text-transform:capitalize;color:var(--navy);background:#e7eef8;border-radius:999px;padding:2px 9px}" +
+    ".rowpick{flex:0 0 auto;width:20px;height:20px;margin-top:14px;align-self:flex-start;cursor:pointer}" +
+    ".bulkbar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--bg);padding:10px 0 12px;margin-bottom:10px;border-bottom:1px solid var(--line)}" +
+    ".bulkbar .selall{font-size:13px;color:var(--soft);display:flex;align-items:center;gap:6px;cursor:pointer}" +
+    ".bulkbar .selall input{width:18px;height:18px}" +
+    ".bulkbar button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 13px;font-size:13px;cursor:pointer;color:var(--ink);font-weight:600}" +
+    ".bulkbar .b-pass{background:var(--navy);color:#fff;border-color:var(--navy)}" +
+    ".bulkbar .b-low{margin-left:auto;color:#a02626;border-color:#f0c9c9}" +
     ".empty{padding:40px 0;text-align:center;color:var(--soft)}" +
     "</style></head><body>" +
     "<header><h1>JobSignal</h1><p>Fractional and interim Customer Success roles, scored against your profile.</p><a class=\"headlink\" href=\"/paste\">Paste an alert email</a></header>" +
     '<div class="tabs">' + tabs + "</div>" +
     '<div class="wrap">' +
-    (rows.length ? cards : '<div class="empty">No roles here yet. Trigger a poll or paste an alert email to fill it.</div>') +
-    "</div></body></html>"
+    (rows.length
+      ? '<form method="post" action="/roles/bulk">' +
+          '<div class="bulkbar">' +
+            '<label class="selall"><input type="checkbox" onclick="jsToggleAll(this)"> Select all</label>' +
+            '<button class="b-pass" name="status" value="passed" type="submit">Pass selected</button>' +
+            '<button name="status" value="reviewed" type="submit">Reviewed</button>' +
+            '<button name="status" value="applied" type="submit">Applied</button>' +
+            '<button class="b-low" formaction="/roles/passlow" name="max" value="4" type="submit">Pass all 4 and under</button>' +
+          "</div>" +
+          cards +
+        "</form>"
+      : '<div class="empty">No roles here yet. Trigger a poll or paste an alert email to fill it.</div>') +
+    "</div>" +
+    "<script>function jsToggleAll(cb){var b=document.querySelectorAll('input[name=ids]');for(var i=0;i<b.length;i++){b[i].checked=cb.checked;}}</script>" +
+    "</body></html>"
   );
 }
 
